@@ -6,12 +6,21 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from .core import BaselineViolationError, InputValidationError, capacity, evaluate, unregistered_load
+from .core import (
+    BaselineViolationError,
+    InputValidationError,
+    capacity,
+    evaluate,
+    peak_risk,
+    unregistered_load,
+)
 from .models import (
     CapacityRequest,
     CapacityResponse,
     EvaluateRequest,
     EvaluateResponse,
+    PeakRiskRequest,
+    PeakRiskResponse,
     UnregisteredLoadRequest,
     UnregisteredLoadResponse,
 )
@@ -22,9 +31,10 @@ app = FastAPI(
         "接收以 source 为根的配电树（线段电阻 / 额定电流、节点恒定负载），"
         "自叶向根累计各段电流，自根向叶计算压降与节点电压，"
         "返回超额定电流与欠压位置；并可评估指定节点可追加的最大恒定负载电流，"
-        "或根据线段实测电流定位唯一未登记正恒定负载的候选节点。"
+        "根据线段实测电流定位唯一未登记正恒定负载的候选节点，"
+        "或校核至多 K 条负载同时升至峰值时的线段最大承载电流与节点最低电压。"
     ),
-    version="1.2.0",
+    version="1.3.0",
 )
 
 
@@ -45,6 +55,8 @@ _FIELD_LABELS = {
     "rated_current": "额定电流",
     "node": "节点",
     "current": "负载电流",
+    "peak_current": "峰值电流",
+    "max_simultaneous_peaks": "同时升峰负载上限",
     "target_node": "目标节点",
     "measurements": "测点列表",
     "segment_id": "线段标识",
@@ -60,8 +72,10 @@ _CUSTOM_MESSAGES = {
     ("source_voltage", "greater_than"): "电源电压必须为正数（> 0）",
     ("resistance", "greater_than_equal"): "电阻不能为负（须 ≥ 0）",
     ("current", "greater_than_equal"): "负载电流不能为负（须 ≥ 0）",
+    ("peak_current", "greater_than_equal"): "峰值电流不能为负（须 ≥ 0）",
     ("rated_current", "greater_than"): "额定电流必须为正数（> 0）",
     ("min_voltage", "greater_than_equal"): "最低允许电压不能为负（须 ≥ 0）",
+    ("max_simultaneous_peaks", "greater_than_equal"): "同时升峰负载上限不能为负（须为非负整数）",
 }
 
 
@@ -79,12 +93,16 @@ def _translate_error(err: dict) -> dict:
     custom = _CUSTOM_MESSAGES.get((field, err_type)) if not in_measurements else None
     if custom:
         message = custom
+    elif err_type == "peak_current_lt_current":
+        message = ctx.get("message", "峰值电流不能小于恒定负载电流（peak_current 须 ≥ current）")
     elif err_type == "missing":
         message = f"缺少必填字段：{label}"
     elif err_type == "greater_than":
         message = f"{label}必须大于 {ctx.get('gt')}"
     elif err_type == "greater_than_equal":
         message = f"{label}不能小于 {ctx.get('ge')}"
+    elif err_type in ("int_from_float", "int_parsing"):
+        message = f"{label}必须为非负整数"
     elif err_type == "finite_number":
         message = f"{label}必须为有限数值"
     elif err_type == "string_too_short":
@@ -94,7 +112,8 @@ def _translate_error(err: dict) -> dict:
     elif err_type.endswith("_parsing") or err_type.endswith("_type"):
         message = f"{label}的类型无效"
     else:
-        message = err.get("msg", "参数无效")
+        raw_msg = err.get("msg", "参数无效")
+        message = raw_msg[len("Value error, ") :] if raw_msg.startswith("Value error, ") else raw_msg
     return {"field": ".".join(loc), "message": message}
 
 
@@ -168,6 +187,21 @@ def unregistered_load_endpoint(payload: UnregisteredLoadRequest) -> dict:
     )
 
 
+@app.post(
+    "/peak-risk",
+    response_model=PeakRiskResponse,
+    summary="校核至多 K 条负载同时升至峰值时的线段最大承载电流与节点最低电压",
+)
+def peak_risk_endpoint(payload: PeakRiskRequest) -> dict:
+    return peak_risk(
+        source_voltage=payload.source_voltage,
+        min_voltage=payload.min_voltage,
+        segments_in=payload.segments,
+        loads_in=payload.loads,
+        max_simultaneous_peaks=payload.max_simultaneous_peaks,
+    )
+
+
 @app.get("/health", summary="健康检查")
 def health() -> dict:
     return {"status": "ok"}
@@ -180,6 +214,7 @@ def index() -> dict:
         "evaluate": "POST /evaluate",
         "capacity": "POST /capacity",
         "unregistered_load": "POST /unregistered-load",
+        "peak_risk": "POST /peak-risk",
         "docs": "/docs",
         "health": "/health",
     }

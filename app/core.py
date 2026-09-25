@@ -13,6 +13,11 @@
 ``unregistered_load`` 假定恰有一个非 source 节点存在未登记的正恒定负载，
 将各测点实测电流与未舍入基线线段电流比较：显著正差（> 1e-6 A）须在 1e-6 A
 内相互一致，据此估计负载电流，并按测点是否位于候选节点的祖先路径筛选相容节点。
+
+``peak_risk`` 在基线潮流之上评估“至多 K 条负载同时升至峰值”的最坏工况：
+升峰负载电流增量 ΔI 使其下游线段同步增流，并按与被校核节点共用的上游路径
+电阻之和产生附加压降；每个约束（各段最大承载电流、各节点最低电压）独立选取
+贡献最大的至多 K 条负载（贡献相同按负载输入序号），不同约束允许不同组合。
 """
 
 from __future__ import annotations
@@ -492,3 +497,162 @@ def unregistered_load(
         )
 
     return _result("located", _round(load_current), candidates, [])
+
+
+def _select_peak_loads(
+    contributions: list[tuple[int, float]], k: int
+) -> list[tuple[int, float]]:
+    """从 (负载输入序号, 贡献) 中取正贡献最大的至多 K 条。
+
+    贡献相同时按负载输入序号升序；比较前将贡献吸附至 9 位小数以消除浮点噪声。
+    """
+    positive = [(index, amount) for index, amount in contributions if amount > EPS]
+    positive.sort(key=lambda item: (-round(item[1], 9), item[0]))
+    return positive[:k]
+
+
+def peak_risk(
+    source_voltage: float,
+    min_voltage: float,
+    segments_in: Sequence,
+    loads_in: Sequence,
+    max_simultaneous_peaks: int,
+) -> dict:
+    """评估至多 ``max_simultaneous_peaks`` 条负载同时升至峰值的最坏工况。
+
+    每条负载可给出 ``peak_current``（缺省等于 ``current``），升峰增量
+    ΔI = peak_current − current。对每条线段、每个节点分别独立求最坏值：
+
+    - 线段：其下游每条负载的增流贡献为 ΔI（升峰使该段同步增流），取贡献
+      最大的至多 K 条之和加基线电流，即为最大承载电流；
+    - 节点：每条负载的附加压降贡献为 R_common(负载节点, 被校核节点) × ΔI，
+      R_common 为两条根路径公共线段（含负载所在节点上游线段）的电阻之和；
+      取贡献最大的至多 K 条之和，从基线电压中扣除即为最低电压。
+
+    不同约束允许对应不同的峰值组合；越限判定沿用 /evaluate 的额定电流、
+    节点最低电压及 EPS 容差规则。
+    """
+    tree = _prepare_tree(source_voltage, segments_in, loads_in)
+
+    # (输入序号 1 起, 所在节点, 升峰增量)；peak_current 缺省等于 current
+    loads: list[tuple[int, str, float]] = []
+    for index, load in enumerate(loads_in, start=1):
+        peak = load.current if load.peak_current is None else load.peak_current
+        delta = peak - load.current
+        if delta > EPS:
+            loads.append((index, load.node, delta))
+
+    seg_by_child = {seg.child: seg for seg in tree.segments}
+
+    # 每条线段的候选增流贡献：负载位于该段下游 ⇔ 负载节点上溯路径经过该段
+    seg_candidates: dict[str, list[tuple[int, float]]] = {seg.id: [] for seg in tree.segments}
+    # 每个节点的候选附加压降贡献（仅非零项）
+    node_candidates: dict[str, list[tuple[int, float]]] = {node: [] for node in tree.order}
+
+    for index, load_node, delta in loads:
+        # 负载节点到 source 的上行路径（自下而上）
+        path: list[Segment] = []
+        node = load_node
+        while node != ROOT_NODE:
+            seg = seg_by_child[node]
+            path.append(seg)
+            node = seg.parent
+
+        for seg in path:
+            seg_candidates[seg.id].append((index, delta))
+
+        # 沿上行路径划分"环带"：环带入口为 path[level].child（level=0 即负载
+        # 节点），环带内节点与负载节点共享自根至入口的全部路径线段，其电阻和
+        # 随上行逐层减去入口下方线段电阻；内环带已访问节点不再重复计入。
+        total_resistance = sum(seg.resistance for seg in path)
+        removed = 0.0
+        visited: set[str] = set()
+        for level, seg in enumerate(path):
+            shared = total_resistance - removed
+            if shared <= EPS:
+                break  # 更外层环带公共电阻更小，贡献均为零
+            # 环带 = 以 seg.child 为根的子树，扣除下一内环带入口子树
+            inner_child = path[level - 1].child if level > 0 else None
+            stack: list[str] = [seg.child]
+            while stack:
+                current = stack.pop()
+                if current in visited:
+                    continue
+                visited.add(current)
+                node_candidates[current].append((index, shared * delta))
+                for child_seg in tree.children_map.get(current, []):
+                    if current == seg.child and child_seg.child == inner_child:
+                        continue  # 内层环带，已按更大公共电阻计入
+                    stack.append(child_seg.child)
+            removed += seg.resistance
+
+    segment_results = []
+    over_current_segments = []
+    for seg in tree.segments:  # 保持输入顺序
+        selected = _select_peak_loads(seg_candidates[seg.id], max_simultaneous_peaks)
+        peak_indices = [idx for idx, _ in selected]
+        worst_current = tree.seg_current[seg.id] + sum(amount for _, amount in selected)
+        over_rated = worst_current > seg.rated_current + EPS
+        item = {
+            "segment_id": seg.id,
+            "parent": seg.parent,
+            "child": seg.child,
+            "current": _round(tree.seg_current[seg.id]),
+            "worst_current": _round(worst_current),
+            "rated_current": seg.rated_current,
+            "peak_load_indices": peak_indices,
+            "over_rated": over_rated,
+        }
+        segment_results.append(item)
+        if over_rated:
+            over_current_segments.append(
+                {
+                    "segment_id": seg.id,
+                    "parent": seg.parent,
+                    "child": seg.child,
+                    "current": _round(worst_current),
+                    "rated_current": seg.rated_current,
+                    "excess": _round(worst_current - seg.rated_current),
+                    "peak_load_indices": peak_indices,
+                }
+            )
+
+    node_results = []
+    under_voltage_nodes = []
+    for node in tree.order:  # BFS 顺序，根在前
+        threshold = _node_threshold(tree, node, min_voltage)
+        selected = _select_peak_loads(node_candidates[node], max_simultaneous_peaks)
+        peak_indices = [idx for idx, _ in selected]
+        worst_voltage = tree.node_voltage[node] - sum(amount for _, amount in selected)
+        under_voltage = worst_voltage < threshold - EPS
+        item = {
+            "node": node,
+            "voltage": _round(tree.node_voltage[node]),
+            "worst_voltage": _round(worst_voltage),
+            "min_voltage": threshold,
+            "load_current": _round(tree.load_map.get(node, 0.0)),
+            "peak_load_indices": peak_indices,
+            "under_voltage": under_voltage,
+        }
+        node_results.append(item)
+        if under_voltage:
+            under_voltage_nodes.append(
+                {
+                    "node": node,
+                    "voltage": _round(worst_voltage),
+                    "min_voltage": threshold,
+                    "deficit": _round(threshold - worst_voltage),
+                    "peak_load_indices": peak_indices,
+                }
+            )
+
+    return {
+        "ok": not over_current_segments and not under_voltage_nodes,
+        "source_voltage": source_voltage,
+        "min_voltage": min_voltage,
+        "max_simultaneous_peaks": max_simultaneous_peaks,
+        "segments": segment_results,
+        "nodes": node_results,
+        "over_current_segments": over_current_segments,
+        "under_voltage_nodes": under_voltage_nodes,
+    }
