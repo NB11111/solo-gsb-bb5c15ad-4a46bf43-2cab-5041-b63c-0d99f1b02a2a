@@ -6,12 +6,21 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from .core import BaselineViolationError, InputValidationError, capacity, evaluate, unregistered_load
+from .core import (
+    BaselineViolationError,
+    InputValidationError,
+    capacity,
+    evaluate,
+    peak_risk,
+    unregistered_load,
+)
 from .models import (
     CapacityRequest,
     CapacityResponse,
     EvaluateRequest,
     EvaluateResponse,
+    PeakRiskRequest,
+    PeakRiskResponse,
     UnregisteredLoadRequest,
     UnregisteredLoadResponse,
 )
@@ -22,9 +31,10 @@ app = FastAPI(
         "接收以 source 为根的配电树（线段电阻 / 额定电流、节点恒定负载），"
         "自叶向根累计各段电流，自根向叶计算压降与节点电压，"
         "返回超额定电流与欠压位置；并可评估指定节点可追加的最大恒定负载电流，"
-        "或根据线段实测电流定位唯一未登记正恒定负载的候选节点。"
+        "根据线段实测电流定位唯一未登记正恒定负载的候选节点，"
+        "或评估至多 K 条负载同时升至峰值时的最坏越限风险。"
     ),
-    version="1.2.0",
+    version="1.3.0",
 )
 
 
@@ -48,6 +58,8 @@ _FIELD_LABELS = {
     "target_node": "目标节点",
     "measurements": "测点列表",
     "segment_id": "线段标识",
+    "peak_current": "峰值电流",
+    "max_simultaneous_peaks": "最大同时峰值数",
 }
 
 # measurements 内字段的中文标签（与负载字段同名时区分为“实测”）
@@ -62,6 +74,8 @@ _CUSTOM_MESSAGES = {
     ("current", "greater_than_equal"): "负载电流不能为负（须 ≥ 0）",
     ("rated_current", "greater_than"): "额定电流必须为正数（> 0）",
     ("min_voltage", "greater_than_equal"): "最低允许电压不能为负（须 ≥ 0）",
+    ("peak_current", "greater_than_equal"): "峰值电流不能为负（须 ≥ 0）",
+    ("max_simultaneous_peaks", "greater_than_equal"): "最大同时峰值数不能为负（须 ≥ 0）",
 }
 
 
@@ -91,6 +105,10 @@ def _translate_error(err: dict) -> dict:
         message = f"{label}不能为空字符串"
     elif err_type in ("too_short", "list_too_short"):
         message = f"{label}不能为空"
+    elif err_type == "value_error":
+        message = err.get("msg", "参数无效")
+        if message.startswith("Value error, "):
+            message = message[len("Value error, "):]
     elif err_type.endswith("_parsing") or err_type.endswith("_type"):
         message = f"{label}的类型无效"
     else:
@@ -168,6 +186,21 @@ def unregistered_load_endpoint(payload: UnregisteredLoadRequest) -> dict:
     )
 
 
+@app.post(
+    "/peak-risk",
+    response_model=PeakRiskResponse,
+    summary="评估至多 K 条负载同时升至峰值时的最坏越限风险",
+)
+def peak_risk_endpoint(payload: PeakRiskRequest) -> dict:
+    return peak_risk(
+        source_voltage=payload.source_voltage,
+        min_voltage=payload.min_voltage,
+        segments_in=payload.segments,
+        loads_in=payload.loads,
+        max_simultaneous_peaks=payload.max_simultaneous_peaks,
+    )
+
+
 @app.get("/health", summary="健康检查")
 def health() -> dict:
     return {"status": "ok"}
@@ -180,6 +213,7 @@ def index() -> dict:
         "evaluate": "POST /evaluate",
         "capacity": "POST /capacity",
         "unregistered_load": "POST /unregistered-load",
+        "peak_risk": "POST /peak-risk",
         "docs": "/docs",
         "health": "/health",
     }
